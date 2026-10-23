@@ -11,4 +11,4 @@ RUN apk add --no-cache ffmpeg && pip install --no-cache-dir pycryptodome pyyaml
 COPY --from=builder /build/eye4_accel.so /app/
 COPY eye4_rtsp_proxy.py /app/
 WORKDIR /app
-CMD ["python3", "eye4_rtsp_proxy.py"]
+ENTRYPOINT ["python3", "eye4_rtsp_proxy.py"]

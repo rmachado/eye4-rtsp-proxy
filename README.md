@@ -125,6 +125,8 @@ log_level: info          # debug, info, warning, error
 motion_cooldown: 30
 motion_poll_interval: 1
 bind_addr: 127.0.0.1     # RTSP + snapshot bind address; use 0.0.0.0 to expose on the LAN
+sensor_streams: false    # true = one RTSP port per sensor (base_port + index)
+sensor_count: 3          # number of sensors when sensor_streams is enabled
 
 # Auto-populated on discovery. Override ports, add names or webhooks here.
 cameras:
@@ -143,6 +145,27 @@ For a camera assigned RTSP port 9555:
 |----------|----------|-------------|
 | `rtsp://host:9555/` | RTSP/TCP | Live video + audio stream |
 | `http://host:10555/snapshot.jpg` | HTTP | JPEG snapshot from cached I-frame |
+
+### Multi-Sensor Cameras
+
+Some cameras (e.g. 3-lens O-KAM Pro / VStarcam VE4 models) send every sensor's
+H.264 stream interleaved on the same PPPP channel. Enable demuxing in the YAML:
+
+```yaml
+sensor_streams: true
+sensor_count: 3
+```
+
+Each sensor then gets its own RTSP server and snapshot endpoint:
+
+| Sensor | RTSP | Snapshot |
+|--------|------|----------|
+| 0 | `rtsp://host:9555/` | `http://host:10555/snapshot.jpg` |
+| 1 | `rtsp://host:9556/` | `http://host:10556/snapshot.jpg` |
+| 2 | `rtsp://host:9557/` | `http://host:10557/snapshot.jpg` |
+
+Without `sensor_streams`, only sensor 0 is forwarded; the other sensors' frames
+are dropped rather than mixed into the first stream.
 
 ## Motion Detection
 

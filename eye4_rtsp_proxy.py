@@ -111,6 +111,11 @@ DEFAULT_CONFIG = {
     "motion_cooldown": 30,
     "motion_poll_interval": 1,
     "bind_addr": "127.0.0.1",
+    # Multi-sensor cameras interleave each sensor's
+    # H.264 stream on the same DRW channel. When enabled, each sensor gets
+    # its own RTSP server on base_port + sensor index.
+    "sensor_streams": False,
+    "sensor_count": 3,
     "extra_broadcasts": [],
     "cameras": {},
 }
@@ -160,7 +165,8 @@ def save_config(path: str, config: dict):
             # Write scalar settings first
             for key in ["username", "password", "base_port", "discovery_time", "log_level", "psk", "enc_mode",
                         "alarm_server_port", "alarm_server_addr", "motion_cooldown", "motion_poll_interval",
-                        "bind_addr", "extra_broadcasts"]:
+                        "bind_addr", "sensor_streams", "sensor_count",
+                        "extra_broadcasts"]:
                 if key in data:
                     yaml.dump({key: data[key]}, f, default_flow_style=False,
                               allow_unicode=True)
@@ -197,15 +203,24 @@ def _get_camera_port(cam_cfg) -> Optional[int]:
 
 
 def assign_port(config: dict, camera_uid: str, base_port: int) -> int:
-    """Assign an RTSP port for a camera UID. Returns existing or next available port."""
+    """Assign an RTSP port for a camera UID. Returns existing or next available port.
+
+    When sensor_streams is enabled each camera reserves a contiguous block of
+    ports (base_port + sensor index), so multi-camera setups must not overlap.
+    """
     cameras = config.get("cameras", {})
     if camera_uid in cameras:
         existing = _get_camera_port(cameras[camera_uid])
         if existing is not None:
             return existing
-    used_ports = {_get_camera_port(v) for v in cameras.values()} - {None}
+    block = int(config.get("sensor_count", 3)) if config.get("sensor_streams") else 1
+    used_ports = set()
+    for value in cameras.values():
+        p = _get_camera_port(value)
+        if p is not None:
+            used_ports.update(range(p, p + block))
     port = base_port
-    while port in used_ports:
+    while any((port + i) in used_ports for i in range(block)):
         port += 1
     # Preserve dict config if it exists (has motion_webhook etc), otherwise store int
     if isinstance(cameras.get(camera_uid), dict):
@@ -1123,13 +1138,13 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
         if self.audio_callback:
             self.audio_callback(data, codec)
 
-    def _on_video_frame(self, frame_type: int, timestamp: int, data: bytes):
+    def _on_video_frame(self, sensor: int, frame_type: int, timestamp: int, data: bytes):
         # Video data is NOT AES-encrypted after P2P_Proprietary decryption
         # (confirmed from pcap: STREAMHEAD + raw H.264 NALs)
         n = self._video_reassembly._frames_received if self._video_reassembly else 0
         if n <= 3 or n % 100 == 0:
-            log.info("Video frame #%d: type=%d size=%d first32=%s",
-                     n, frame_type, len(data),
+            log.info("Video frame #%d: sensor=%d type=%d size=%d first32=%s",
+                     n, sensor, frame_type, len(data),
                      data[:32].hex() if data else "empty")
             if n <= 3:
                 if data[:4] == b'\x00\x00\x00\x01':
@@ -1139,7 +1154,7 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
                     nal_type = data[3] & 0x1F
                     log.info("  H.264 NAL type=%d (3-byte start code)", nal_type)
         if self.video_callback:
-            self.video_callback(frame_type, timestamp, data)
+            self.video_callback(sensor, frame_type, timestamp, data)
 
     # --- Session management ---
 
@@ -1557,6 +1572,17 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
             self._seen_drw_indices[CH_VIDEO].clear()
         self._drw_high_water[CH_VIDEO] = -1
         self._video_reassembly = None
+        # DualAuthentication=2 firmware (e.g. VE4... / 10.50.x) gates video
+        # behind a second, app-style cloud-auth call. The camera accepts dummy
+        # loginAccount/loginToken values, but the real device password must
+        # still be supplied in loginuse/loginpas. Without this call the camera
+        # answers livestream.cgi with result=0 but never sends any media.
+        auth_cgi = (f"GET /eye4_authentication.cgi?"
+                    f"loginAccount=1&loginToken=abc"
+                    f"&loginuse={self.username}&loginpas={self.password}"
+                    f"&user={self.username}&pwd={self.password}&")
+        await self._send_cmd(auth_cgi)
+        await asyncio.sleep(0.2)
         # streamid=10 = main stream (H.264, 1080p)
         cgi = (f"GET /livestream.cgi?"
                f"streamid=10&substream=1"
@@ -1626,6 +1652,10 @@ class PPPPUnifiedProtocol(asyncio.DatagramProtocol):
         The pcap shows the app does this — packs get_record + get_status +
         get_params + livestream into one DRW packet."""
         cgis = [
+            (f"GET /eye4_authentication.cgi?"
+             f"loginAccount=1&loginToken=abc"
+             f"&loginuse={self.username}&loginpas={self.password}"
+             f"&user={self.username}&pwd={self.password}&"),
             (f"GET /get_status.cgi?"
              f"loginuse={self.username}&loginpas={self.password}"
              f"&user={self.username}&pwd={self.password}&"),
@@ -1728,6 +1758,11 @@ class VideoReassembly:
         self._current_frame_type = FRAME_P
         self._current_timestamp = 0
         self._current_frame_len = 0
+        # Multi-sensor cameras (e.g. O-KAM Pro 3-lens) interleave several
+        # independent H.264 streams on the same DRW channel. STREAMHEAD
+        # offset 26 holds the sensor index (LE16). Single-sensor cameras
+        # leave it at 0.
+        self._current_sensor = 0
         self._current_frame_data = bytearray()
         self._in_frame = False
         self._frames_received = 0
@@ -1818,10 +1853,12 @@ class VideoReassembly:
                 sectime = struct.unpack_from("<I", buf, self._off + 8)[0]
                 self._current_timestamp = sectime * 1000 + millitime
                 self._current_frame_len = struct.unpack_from("<I", buf, self._off + 16)[0]
+                self._current_sensor = int.from_bytes(
+                    buf[self._off + 26:self._off + 28], "little")
 
-                log.debug("STREAMHEAD: type=%d len=%d ts=%d",
-                          self._current_frame_type, self._current_frame_len,
-                          self._current_timestamp)
+                log.debug("STREAMHEAD: sensor=%d type=%d len=%d ts=%d",
+                          self._current_sensor, self._current_frame_type,
+                          self._current_frame_len, self._current_timestamp)
 
                 self._off += STREAMHEAD_SIZE
                 self._current_frame_data = bytearray()
@@ -1850,9 +1887,11 @@ class VideoReassembly:
         self._current_frame_data = bytearray()
         if not data:
             return
-        log.debug("Frame #%d: type=%d size=%d",
-                  self._frames_received, self._current_frame_type, len(data))
-        self.frame_callback(self._current_frame_type, self._current_timestamp, data)
+        log.debug("Frame #%d: sensor=%d type=%d size=%d",
+                  self._frames_received, self._current_sensor,
+                  self._current_frame_type, len(data))
+        self.frame_callback(self._current_sensor, self._current_frame_type,
+                            self._current_timestamp, data)
 
 
 # =============================================================================
@@ -2074,9 +2113,13 @@ class CameraSession:
                  motion_webhook: Optional[str] = None,
                  motion_cooldown: float = 30.0,
                  motion_poll_interval: float = 1.0,
-                 bind_addr: str = "127.0.0.1"):
+                 bind_addr: str = "127.0.0.1",
+                 sensor_streams: bool = False,
+                 sensor_count: int = 3):
         self.camera = camera
         self.rtsp_port = rtsp_port
+        self.sensor_streams = sensor_streams
+        self.sensor_count = max(1, int(sensor_count))
         self.username = username
         self.password = password
         self.p2p_key = p2p_key
@@ -2090,7 +2133,8 @@ class CameraSession:
         self.motion_handler: Optional[MotionHandler] = None
 
         self.protocol: Optional[PPPPUnifiedProtocol] = None
-        self.rtsp: Optional["RTSPServer"] = None
+        self.rtsp: Optional["RTSPServer"] = None  # primary (sensor 0)
+        self.rtsp_servers: dict[int, "RTSPServer"] = {}
         self.transport: Optional[asyncio.DatagramTransport] = None
         self.state = STATE_STOPPED
         self._running = False
@@ -2104,10 +2148,20 @@ class CameraSession:
         self.state = STATE_CONNECTING
         log.info("[%s] Starting session on RTSP port %d", self.camera.label, self.rtsp_port)
 
-        # Create RTSP server for this camera
-        self.rtsp = RTSPServer(host=self.bind_addr, port=self.rtsp_port,
-                               snapshot_host=self.bind_addr)
-        await self.rtsp.start()
+        # Create one RTSP server per sensor when multi-sensor demuxing is on.
+        # Otherwise create the usual single server and only forward sensor 0.
+        count = self.sensor_count if self.sensor_streams else 1
+        for sensor in range(count):
+            port = self.rtsp_port + sensor
+            server = RTSPServer(host=self.bind_addr, port=port,
+                                snapshot_host=self.bind_addr)
+            await server.start()
+            self.rtsp_servers[sensor] = server
+        self.rtsp = self.rtsp_servers[0]
+        if self.sensor_streams:
+            log.info("[%s] Sensor streams: %s", self.camera.label,
+                     ", ".join(f"sensor {s} → :{self.rtsp_port + s}"
+                               for s in range(count)))
 
         # Create protocol and connect
         await self._create_and_connect()
@@ -2117,11 +2171,14 @@ class CameraSession:
 
     async def _create_and_connect(self):
         """Create a fresh protocol+transport and connect to camera."""
-        # Video callback that also tracks last DRW time
-        def video_cb(frame_type, timestamp, data):
+        # Video callback that also tracks last DRW time. Frames carry the
+        # sensor index parsed from STREAMHEAD, so each sensor goes to its own
+        # RTSP server (or is dropped when sensor_streams is disabled).
+        def video_cb(sensor, frame_type, timestamp, data):
             self._last_drw_time = asyncio.get_event_loop().time()
-            if self.rtsp:
-                self.rtsp.push_video_frame(frame_type, timestamp, data)
+            server = self.rtsp_servers.get(sensor)
+            if server:
+                server.push_video_frame(frame_type, timestamp, data)
 
         def audio_cb(data, codec):
             self._last_drw_time = asyncio.get_event_loop().time()
@@ -2193,8 +2250,8 @@ class CameraSession:
                 if now - self._last_audio_request > 2.0:
                     self._last_audio_request = now
                     await self.protocol._send_start_audio()
-        if self.rtsp:
-            self.rtsp.play_callback = on_rtsp_play
+        for server in self.rtsp_servers.values():
+            server.play_callback = on_rtsp_play
 
         self.state = STATE_CONNECTED
         self._last_drw_time = asyncio.get_event_loop().time()
@@ -2214,8 +2271,10 @@ class CameraSession:
             self.motion_handler.stop()
         if self.protocol:
             await self.protocol.stop()
-        if self.rtsp:
-            await self.rtsp.stop()
+        for server in self.rtsp_servers.values():
+            await server.stop()
+        self.rtsp_servers.clear()
+        self.rtsp = None
         log.info("[%s] Session stopped", self.camera.label)
 
     async def _teardown_protocol(self):
@@ -2276,9 +2335,9 @@ class CameraSession:
             elif self.state == STATE_OFFLINE:
                 log.info("[%s] Tearing down stale session, entering RECONNECTING", self.camera.label)
                 await self._teardown_protocol()
-                # Clear cached I-frame so Scrypted doesn't serve a stale snapshot
-                if self.rtsp:
-                    self.rtsp._cached_iframe = None
+                # Clear cached I-frames so clients don't get stale snapshots
+                for server in self.rtsp_servers.values():
+                    server._cached_iframe = None
                 self.state = STATE_RECONNECTING
                 # Wait before first reconnect to let camera sessions expire
                 # and stagger reconnects across cameras
@@ -2345,6 +2404,7 @@ class RTSPServer:
         self.audio_frames_sent = 0
         # Cached last I-frame for instant start of new clients
         self._cached_iframe: Optional[bytes] = None
+        self._cached_iframe_ts: int = 0
         # Snapshot endpoint: bound concurrency and cache the encoded JPEG
         self._snapshot_server: Optional[asyncio.Server] = None
         self._snapshot_sem = asyncio.Semaphore(2)
@@ -2600,6 +2660,7 @@ class RTSPServer:
             # so new clients can get instant video start.
             if is_iframe:
                 self._cached_iframe = data
+                self._cached_iframe_ts = timestamp
 
             playing_clients = [c for c in self._clients if c.playing]
             if not playing_clients:
@@ -2620,16 +2681,24 @@ class RTSPServer:
                              self.port, "live" if is_iframe else "cached",
                              len(iframe_data), len(new_clients))
                     if not is_iframe:
+                        # Use the cached frame's camera timestamp so the
+                        # client sees an older PTS followed by the live frame.
+                        self._rtp_ts = (self._cached_iframe_ts * 90) & 0xFFFFFFFF
                         await self._send_frame_to_clients(iframe_data, new_clients)
-                        self._rtp_ts = (self._rtp_ts + 3000) & 0xFFFFFFFF
 
             # Send current frame to all clients that have received an I-frame
             ready_clients = [c for c in playing_clients if c.got_iframe]
             if not ready_clients:
                 continue
 
+            # Use the camera's STREAMHEAD millisecond timestamp. This is
+            # essential for multi-sensor demux: each sensor runs at ~10 fps,
+            # while the old fixed +3000 increment assumed a 30 fps stream.
+            if timestamp:
+                self._rtp_ts = (timestamp * 90) & 0xFFFFFFFF
+            else:
+                self._rtp_ts = (self._rtp_ts + 9000) & 0xFFFFFFFF
             await self._send_frame_to_clients(data, ready_clients)
-            self._rtp_ts = (self._rtp_ts + 3000) & 0xFFFFFFFF
             self.frames_sent += 1
             if self.frames_sent % 100 == 0:
                 log.info(":%d Sent %d frames to %d clients (playing=%d, new=%d)",
@@ -3566,6 +3635,8 @@ async def run_proxy(config: dict, config_path: str, target_ip: Optional[str] = N
             motion_cooldown=float(motion_cooldown),
             motion_poll_interval=float(motion_poll_interval),
             bind_addr=config.get("bind_addr", "127.0.0.1"),
+            sensor_streams=bool(config.get("sensor_streams", False)),
+            sensor_count=int(config.get("sensor_count", 3)),
         )
         sessions[cam.uid] = session
         await session.start()
@@ -3595,8 +3666,14 @@ async def run_proxy(config: dict, config_path: str, target_ip: Optional[str] = N
     log.info("=== Proxy Running ===")
     for uid, sess in sessions.items():
         webhook_status = f" [motion→webhook]" if sess.motion_webhook else ""
-        log.info("  %s → rtsp://%s:%d/%s", sess.camera.label, sess.bind_addr,
-                 sess.rtsp_port, webhook_status)
+        if sess.sensor_streams and len(sess.rtsp_servers) > 1:
+            for sensor in sorted(sess.rtsp_servers):
+                log.info("  %s sensor %d → rtsp://%s:%d/%s",
+                         sess.camera.label, sensor, sess.bind_addr,
+                         sess.rtsp_port + sensor, webhook_status)
+        else:
+            log.info("  %s → rtsp://%s:%d/%s", sess.camera.label, sess.bind_addr,
+                     sess.rtsp_port, webhook_status)
     webhooks = sum(1 for s in sessions.values() if s.motion_webhook)
     if webhooks:
         log.info("  Motion detection: %d camera(s) polling alarm_status (cooldown=%ds)", webhooks, motion_cooldown)

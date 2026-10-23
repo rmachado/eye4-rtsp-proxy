@@ -441,6 +441,20 @@ Offset  Size  Field             Description
 
 Full timestamp = `seconds * 1000 + milliseconds`.
 
+### Multi-Sensor Index (offset 26)
+
+On multi-sensor cameras (e.g. the 3-lens O-KAM Pro / VStarcam VE4 family), the
+camera interleaves several independent H.264 streams on the same video channel.
+The sensor index is a **little-endian 16-bit value at offset 26** (bytes 24–25
+are zero, bytes 28–31 carry flags). Values observed: `0`, `1`, `2` at roughly
+10 fps each, for 30 fps total on the channel.
+
+Single-sensor cameras leave this field at `0`. The proxy reads it and, when
+`sensor_streams: true` is configured, routes each sensor to its own RTSP server
+(`base_port + sensor_index`). Without demuxing, the three H.264 streams are
+concatenated into one decoder and produce the characteristic "lens switching"
+and mixed-pixel corruption.
+
 ### Frame Type Byte (offset 4)
 
 | Value | Meaning |
